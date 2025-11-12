@@ -1,10 +1,11 @@
 import { Injectable } from '@nestjs/common';
 import { z } from 'zod';
+import * as dotenv from 'dotenv';
 
 export class InvalidEnvError extends Error {
   constructor(
     message: string,
-    public readonly issues: z.ZodIssue[],
+    public readonly error: z.ZodError,
   ) {
     super(message);
     this.name = 'InvalidEnvError';
@@ -48,6 +49,7 @@ export class EnvService {
   private readonly env: Env;
 
   constructor() {
+    dotenv.config();
     this.env = this.validateEnv();
   }
 
@@ -61,7 +63,7 @@ export class EnvService {
     if (!result.success) {
       throw new InvalidEnvError(
         'Configuracion de entorno invalida',
-        result.error.issues,
+        result.error,
       );
     }
 
