@@ -32,7 +32,7 @@ const envSchema = z.object({
 
   API_KEY: z.string().min(1, 'API_KEY no puede estar vacio'),
 
-  BASE_URL: z.string().url('BASE_URL debe ser una URL valida'),
+  BASE_URL: z.url('BASE_URL debe ser una URL valida'),
 });
 
 /**
