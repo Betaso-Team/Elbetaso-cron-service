@@ -1,11 +1,14 @@
-import { Injectable, Logger, OnModuleInit } from '@nestjs/common';
-import { ConfigService } from '@nestjs/config';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { SchedulerRegistry } from '@nestjs/schedule';
 import { CronJob } from 'cron';
 import { firstValueFrom } from 'rxjs';
 import { AxiosError, AxiosResponse } from 'axios';
-import { cronJobsConfig, CronJobConfig } from '../config/cron-jobs.config';
+
+import { JOB_CONFIGS, JobConfig } from './job.config';
+import { LoggerBuilder, LoggerService } from '../logger';
+import { EnvService } from '../env';
+import { JobNotFoundError } from './cron.errors';
 
 interface JobExecutionResult {
   success: boolean;
@@ -15,77 +18,84 @@ interface JobExecutionResult {
 
 @Injectable()
 export class CronService implements OnModuleInit {
-  private readonly logger = new Logger(CronService.name);
   private readonly apiKey: string;
   private readonly baseUrl: string;
-  private readonly cronJobs: CronJobConfig[] = cronJobsConfig;
+  private jobConfigs: JobConfig[] = [...JOB_CONFIGS];
+  private readonly logger: LoggerService;
 
   constructor(
     private readonly httpService: HttpService,
-    private readonly configService: ConfigService,
+    private readonly envService: EnvService,
     private readonly schedulerRegistry: SchedulerRegistry,
+    loggerBuilder: LoggerBuilder,
   ) {
-    this.apiKey = this.configService.get<string>('API_KEY') ?? '';
-    this.baseUrl = this.configService.get<string>('BASE_URL') ?? '';
+    this.apiKey = this.envService.get('API_KEY');
+    this.baseUrl = this.envService.get('BASE_URL');
+    this.logger = loggerBuilder.buildWithContext(CronService.name);
   }
 
   onModuleInit(): void {
-    this.initializeCronJobs();
+    this.initializeJobs();
   }
 
-  private initializeCronJobs(): void {
+  private initializeJobs(): void {
     this.logger.log('🚀 Inicializando cron jobs...\n');
 
-    this.cronJobs.forEach((jobConfig, index) => {
-      if (jobConfig.enabled === false) {
-        this.logger.warn(`⏭️  Saltando (deshabilitado): ${jobConfig.name}`);
+    const successfulJobs: JobConfig[] = [];
+    this.jobConfigs.forEach((cronJobConfig, index) => {
+      if (cronJobConfig.enabled === false) {
+        this.logger.log(`⏭️  Saltando (deshabilitado): ${cronJobConfig.name}`);
         return;
       }
 
       try {
-        const job = new CronJob(jobConfig.schedule, () => {
-          void this.executeEndpoint(jobConfig.name, jobConfig.endpoint);
+        const job = new CronJob(cronJobConfig.schedule, async () => {
+          await this.startJob(cronJobConfig.name, cronJobConfig.urlPath);
         });
 
         this.schedulerRegistry.addCronJob(`job-${index}`, job);
         job.start();
 
         this.logger.log(
-          `⏰ Configurado: ${jobConfig.name} (${jobConfig.schedule})`,
+          `⏰ Configurado: ${cronJobConfig.name} (${cronJobConfig.schedule})`,
         );
+        successfulJobs.push(cronJobConfig);
       } catch (error) {
-        this.logger.error(
-          `❌ Error al configurar ${jobConfig.name}: ${this.getErrorMessage(error)}`,
+        this.logger.warn(
+          `❌ Error al configurar ${cronJobConfig.name}: ${this.getErrorMessage(error)}`,
         );
       }
     });
 
+    // Solo mantener los jobs que se configuraron exitosamente
+    this.jobConfigs = successfulJobs;
     this.logger.log(
-      `\n✅ Total de cron jobs configurados: ${this.cronJobs.filter((j) => j.enabled !== false).length}\n`,
+      `\n✅ Total de cron jobs configurados: ${this.jobConfigs.length}\n`,
     );
   }
 
-  private async executeEndpoint(
-    name: string,
-    endpoint: string,
+  private async startJob(
+    jobName: string,
+    urlPath: string,
   ): Promise<JobExecutionResult> {
-    const fullUrl = `${this.baseUrl}${endpoint}`;
+    const fullUrl = `${this.baseUrl}${urlPath}`;
 
     try {
-      this.logger.log(`🔄 [${new Date().toISOString()}] Ejecutando: ${name}`);
+      this.logger.log(
+        `🔄 [${new Date().toISOString()}] Ejecutando: ${jobName}`,
+      );
 
       const response: AxiosResponse = await firstValueFrom(
         this.httpService.get(fullUrl, {
           headers: {
             accept: '*/*',
-            'X-Internal-Api-Key': this.apiKey,
+            'x-internal-api-key': this.apiKey,
           },
           timeout: 30000,
         }),
       );
-
       this.logger.log(
-        `✅ [${new Date().toISOString()}] Completado: ${name} - Status: ${response.status}`,
+        `✅ [${new Date().toISOString()}] Completado: ${jobName} - Status: ${response.status}`,
       );
 
       return {
@@ -94,11 +104,9 @@ export class CronService implements OnModuleInit {
       };
     } catch (error) {
       const errorMessage = this.getErrorMessage(error);
-
-      this.logger.error(
-        `❌ [${new Date().toISOString()}] Error en ${name}: ${errorMessage}`,
+      this.logger.warn(
+        `❌ [${new Date().toISOString()}] Error en ${jobName}: ${errorMessage}`,
       );
-
       if (this.isAxiosError(error)) {
         this.logger.error(`   Status: ${error.response?.status ?? 'N/A'}`);
         this.logger.error(
@@ -134,55 +142,108 @@ export class CronService implements OnModuleInit {
     return 'Error desconocido';
   }
 
-  // Método público para ejecutar un job manualmente
-  async executeJobManually(jobIndex: number): Promise<JobExecutionResult> {
-    if (jobIndex < 0 || jobIndex >= this.cronJobs.length) {
-      throw new Error('Job index inválido');
+  /**
+   * Ejecuta un job manualmente por su índice
+   *
+   * @param jobIndex - El índice del job en la lista de configuración (0-based)
+   * @returns Promise con el resultado de la ejecución del job
+   * @throws {JobNotFoundError} Si el job con el índice especificado no existe
+   *
+   * @example
+   * ```typescript
+   * const result = await cronService.startJobManually(0);
+   * if (result.success) {
+   *   console.log('Job ejecutado exitosamente', result.data);
+   * } else {
+   *   console.error('Job falló', result.error);
+   * }
+   * ```
+   */
+  async startJobManually(jobIndex: number): Promise<JobExecutionResult> {
+    const job = this.jobConfigs[jobIndex];
+    if (!job) {
+      throw new JobNotFoundError(jobIndex);
     }
-
-    const job = this.cronJobs[jobIndex];
     this.logger.log(`🔧 Ejecución manual solicitada: ${job.name}`);
 
-    return await this.executeEndpoint(job.name, job.endpoint);
+    return await this.startJob(job.name, job.urlPath);
   }
 
-  // Método para obtener la lista de jobs
-  getJobsList(): Array<{
+  /**
+   * Obtiene la lista de todos los jobs configurados exitosamente
+   *
+   * @returns Array con la información de cada job (índice, nombre, schedule, endpoint, estado)
+   *
+   * @remarks
+   * Solo incluye jobs que se inicializaron correctamente.
+   * Jobs deshabilitados o que fallaron durante la inicialización no aparecen en esta lista.
+   *
+   * @example
+   * ```typescript
+   * const jobs = cronService.getJobList();
+   * console.log(`Total de jobs: ${jobs.length}`);
+   * jobs.forEach(job => console.log(`${job.index}: ${job.name}`));
+   * ```
+   */
+  getJobList(): Array<{
     index: number;
     name: string;
     schedule: string;
     endpoint: string;
     enabled: boolean;
   }> {
-    return this.cronJobs.map((job, index) => ({
+    return this.jobConfigs.map((job, index) => ({
       index,
       name: job.name,
       schedule: job.schedule,
-      endpoint: job.endpoint,
+      endpoint: job.urlPath,
       enabled: job.enabled !== false,
     }));
   }
 
-  // Método para obtener el estado de un job específico
+  /**
+   * Obtiene el estado actual de un job específico
+   *
+   * @param jobIndex - El índice del job en la lista de configuración (0-based)
+   * @returns Objeto con el estado del job (running, lastDate, nextDate)
+   * @throws {JobNotFoundError} Si el job con el índice especificado no existe
+   *
+   * @remarks
+   * - `running`: Indica si el job está actualmente en ejecución
+   * - `lastDate`: Fecha/hora de la última ejecución (null si nunca se ejecutó)
+   * - `nextDate`: Fecha/hora de la próxima ejecución programada
+   *
+   * @example
+   * ```typescript
+   * try {
+   *   const status = cronService.getJobStatus(0);
+   *   console.log('Job running:', status.running);
+   *   console.log('Next execution:', status.nextDate);
+   * } catch (error) {
+   *   if (error instanceof JobNotFoundError) {
+   *     console.error('Job no encontrado');
+   *   }
+   * }
+   * ```
+   */
   getJobStatus(jobIndex: number): {
     running: boolean;
     lastDate: string | null;
     nextDate: string | null;
   } {
-    try {
-      const job = this.schedulerRegistry.getCronJob(`job-${jobIndex}`);
-      const lastDate = job.lastDate();
-      const nextDate = job.nextDate();
-
-      return {
-        running: (job as unknown as { running: boolean }).running,
-        lastDate: lastDate ? lastDate.toString() : null,
-        nextDate: nextDate ? nextDate.toString() : null,
-      };
-    } catch (error) {
-      throw new Error(
-        `Job con índice ${jobIndex} no encontrado: ${error instanceof Error ? error.message : 'Error desconocido'}`,
-      );
+    const jobConfig = this.jobConfigs[jobIndex];
+    if (!jobConfig) {
+      throw new JobNotFoundError(jobIndex);
     }
+
+    const job = this.schedulerRegistry.getCronJob(`job-${jobIndex}`);
+    const lastDate = job.lastDate();
+    const nextDate = job.nextDate();
+
+    return {
+      running: (job as unknown as { running: boolean }).running,
+      lastDate: lastDate ? lastDate.toString() : null,
+      nextDate: nextDate ? nextDate.toString() : null,
+    };
   }
 }

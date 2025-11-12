@@ -1,15 +1,11 @@
 import { Module } from '@nestjs/common';
-import { ConfigModule } from '@nestjs/config';
 import { ScheduleModule } from '@nestjs/schedule';
+
 import { CronModule } from './cron/cron.module';
+import { EnvModule } from './env';
+import { LoggerModule } from './logger';
 
 @Module({
-  imports: [
-    ConfigModule.forRoot({
-      isGlobal: true,
-    }),
-    ScheduleModule.forRoot(),
-    CronModule,
-  ],
+  imports: [EnvModule, LoggerModule, ScheduleModule.forRoot(), CronModule],
 })
 export class AppModule {}
